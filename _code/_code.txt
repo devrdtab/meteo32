@@ -1,0 +1,404 @@
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <Arduino.h>
+#include <LiquidCrystal_I2C.h>
+#include <Wire.h>
+
+// ================= PINS =================
+#define PIN_BTN 10
+#define PIN_LED_GREEN 5
+#define PIN_LED_RED 6
+#define PIN_BUZZER 13
+
+// ================= LCD =================
+#define LCD_WIDTH 16
+#define LCD_HEIGHT 2
+
+// ================= CALIBRATION =================
+#define CAL_TEMP_OFFSET -1.2f
+#define CAL_HUM_OFFSET -1.0f
+#define CAL_PRES_OFFSET 10.9f
+
+// ================= THRESHOLDS =================
+#define THRESHOLD_TEMP_MAX 26.0f
+#define THRESHOLD_TEMP_MIN 19.0f
+#define THRESHOLD_HUM_MAX 80.0f
+#define THRESHOLD_HUM_MIN 20.0f
+#define THRESHOLD_PRES_MAX 1015.0f
+#define THRESHOLD_PRES_MIN 1000.0f
+
+// ================= TIMING =================
+#define SENSOR_READ_PERIOD 10000UL
+#define ACTIVE_DISPLAY_TIME 5000UL
+
+#define STANDBY_LED_PERIOD 7000UL
+#define STANDBY_LED_PULSE 10UL
+
+#define ALARM_LED_HALF_PERIOD 1000UL
+#define ALARM_BUZZER_PERIOD 3000UL
+#define ALARM_BUZZER_PULSE 100UL
+#define ALARM_COOLDOWN 3600000UL
+
+#define STARTUP_DISPLAY_TIME 7000UL // показания после загрузки 7 секунд
+
+enum AppMode { MODE_STANDBY, MODE_ACTIVE, MODE_ALARM };
+
+// ================= OBJECTS =================
+LiquidCrystal_I2C lcd(0x27, LCD_WIDTH, LCD_HEIGHT);
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+
+// ================= STATE =================
+AppMode mode = MODE_STANDBY;
+
+float t = 0, h = 0, p = 0;
+
+bool aT = false;
+bool aH = false;
+bool aP = false;
+
+unsigned long lastSensor = 0;
+unsigned long activeStart = 0;
+
+unsigned long greenStart = 0;
+unsigned long greenLast = 0;
+bool greenOn = false;
+
+unsigned long redLast = 0;
+bool redOn = false;
+
+unsigned long buzzLast = 0;
+unsigned long buzzStart = 0;
+bool buzzOn = false;
+int buzzCount = 0;
+
+bool cooldown = false;
+unsigned long cooldownStart = 0;
+
+// ================= BUTTON =================
+bool lastBtn = HIGH;
+bool stableBtn = HIGH;
+unsigned long btnTime = 0;
+
+bool buttonPressed() {
+  bool r = digitalRead(PIN_BTN);
+  bool pressed = false;
+
+  if (r != lastBtn) {
+    btnTime = millis();
+    lastBtn = r;
+  }
+
+  if (millis() - btnTime > 50) {
+    if (r == LOW && stableBtn == HIGH)
+      pressed = true;
+
+    stableBtn = r;
+  }
+
+  return pressed;
+}
+
+// ================= DISPLAY =================
+void clearLine(int line) {
+  lcd.setCursor(0, line);
+  for (int i = 0; i < LCD_WIDTH; i++) {
+    lcd.print(" ");
+  }
+  lcd.setCursor(0, line);
+}
+
+void bootAnimation() {
+  const int totalSteps = 100;
+  const int lcdDelay = 80;
+  int ledState = LOW;
+  unsigned long lastBlink = 0;
+
+  lcd.display();
+  lcd.backlight();
+  clearLine(0);
+  clearLine(1);
+
+  for (int percent = 0; percent <= totalSteps; percent++) {
+    int charsToFill = (percent * LCD_WIDTH) / 100;
+
+    lcd.setCursor(0, 0);
+    for (int i = 0; i < LCD_WIDTH; i++) {
+      lcd.write(i < charsToFill ? (uint8_t)255 : ' ');
+    }
+
+    lcd.setCursor(0, 1);
+    lcd.print("Loading: ");
+    if (percent < 10)
+      lcd.print(" ");
+    lcd.print(percent);
+    lcd.print("%   ");
+
+    int blinkInterval = map(percent, 0, totalSteps, 400, 50);
+    if (millis() - lastBlink >= (unsigned long)blinkInterval) {
+      ledState = !ledState;
+      digitalWrite(PIN_LED_GREEN, ledState);
+      lastBlink = millis();
+    }
+
+    delay(lcdDelay);
+  }
+
+  digitalWrite(PIN_LED_GREEN, LOW);
+  clearLine(0);
+  clearLine(1);
+}
+
+void lcdUpdate() {
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+
+  lcd.print(aT ? "*" : " ");
+  lcd.print("T:");
+  lcd.print(t, 1);
+  lcd.print("C ");
+
+  lcd.print(aH ? "*" : " ");
+  lcd.print("H:");
+  lcd.print((int)h);
+  lcd.print("%");
+
+  lcd.setCursor(0, 1);
+
+  lcd.print(aP ? "*" : " ");
+  lcd.print("P:");
+  lcd.print((int)p);
+  lcd.print("hPa");
+}
+
+void lcdOn(bool on) {
+  if (on) {
+    lcd.display();
+    lcd.backlight();
+  } else {
+    lcd.noDisplay();
+    lcd.noBacklight();
+  }
+}
+
+// ================= SENSORS =================
+void readSensors() {
+  sensors_event_t h_e, t_e;
+
+  if (aht.getEvent(&h_e, &t_e)) {
+    t = t_e.temperature + CAL_TEMP_OFFSET;
+    h = h_e.relative_humidity + CAL_HUM_OFFSET;
+  }
+
+  p = bmp.readPressure() / 100.0f + CAL_PRES_OFFSET;
+
+  aT = (t > THRESHOLD_TEMP_MAX || t < THRESHOLD_TEMP_MIN);
+  aH = (h > THRESHOLD_HUM_MAX || h < THRESHOLD_HUM_MIN);
+  aP = (p > THRESHOLD_PRES_MAX || p < THRESHOLD_PRES_MIN);
+
+  Serial.printf("T=%.1f H=%.1f P=%.1f\n", t, h, p);
+}
+
+bool alarm() { return aT || aH || aP; }
+
+// ================= MODES =================
+void enterStandby() {
+  mode = MODE_STANDBY;
+  lcdOn(false);
+
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  greenOn = false;
+  greenLast = millis() - STANDBY_LED_PERIOD;
+}
+
+void enterActive() {
+  mode = MODE_ACTIVE;
+  lcdOn(true);
+
+  readSensors();
+  lcdUpdate();
+
+  activeStart = millis();
+}
+
+void enterAlarm() {
+  mode = MODE_ALARM;
+  lcdOn(false);
+
+  redOn = false;
+  buzzOn = false;
+  buzzCount = 0;
+
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+}
+
+// ================= HANDLERS =================
+void handleStandby(bool btn) {
+  unsigned long now = millis();
+
+  if (!greenOn && now - greenLast >= STANDBY_LED_PERIOD) {
+    digitalWrite(PIN_LED_GREEN, HIGH);
+    greenOn = true;
+    greenStart = now;
+    greenLast = now;
+  }
+
+  if (greenOn && now - greenStart >= STANDBY_LED_PULSE) {
+    digitalWrite(PIN_LED_GREEN, LOW);
+    greenOn = false;
+  }
+
+  if (now - lastSensor > SENSOR_READ_PERIOD) {
+    lastSensor = now;
+    readSensors();
+
+    if (cooldown && now - cooldownStart >= ALARM_COOLDOWN) {
+      cooldown = false;
+    }
+
+    if (alarm() && !cooldown) {
+      enterAlarm();
+      return;
+    }
+  }
+
+  if (btn)
+    enterActive();
+}
+
+void handleActive(bool btn) {
+  unsigned long now = millis();
+
+  if (now - lastSensor > SENSOR_READ_PERIOD) {
+    lastSensor = now;
+    readSensors();
+    lcdUpdate();
+  }
+
+  if (btn) {
+    activeStart = millis();
+    readSensors();
+    lcdUpdate();
+  }
+
+  if (now - activeStart > ACTIVE_DISPLAY_TIME) {
+    enterStandby();
+  }
+}
+
+void handleAlarm(bool btn) {
+  unsigned long now = millis();
+
+  if (now - redLast > ALARM_LED_HALF_PERIOD) {
+    redOn = !redOn;
+    digitalWrite(PIN_LED_RED, redOn);
+    redLast = now;
+  }
+
+  if (!buzzOn && buzzCount == 0 && now - buzzLast > ALARM_BUZZER_PERIOD) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    buzzOn = true;
+    buzzStart = now;
+    buzzCount = 1;
+  }
+
+  if (buzzOn && now - buzzStart > ALARM_BUZZER_PULSE) {
+    digitalWrite(PIN_BUZZER, LOW);
+    buzzOn = false;
+
+    if (buzzCount == 1) {
+      buzzCount = 2;
+      buzzStart = now;
+    } else {
+      buzzCount = 0;
+      buzzLast = now;
+    }
+  }
+
+  if (!buzzOn && buzzCount == 2 && now - buzzStart > ALARM_BUZZER_PULSE) {
+    digitalWrite(PIN_BUZZER, HIGH);
+    buzzOn = true;
+    buzzStart = now;
+    buzzCount = 3;
+  }
+
+  if (btn) {
+    cooldown = true;
+    cooldownStart = now;
+    enterActive();
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  delay(500);
+
+  pinMode(PIN_LED_GREEN, OUTPUT);
+  pinMode(PIN_LED_RED, OUTPUT);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_BTN, INPUT_PULLUP);
+
+  digitalWrite(PIN_LED_GREEN, LOW);
+  digitalWrite(PIN_LED_RED, LOW);
+  digitalWrite(PIN_BUZZER, LOW);
+
+  Wire.begin(8, 9);
+  Wire.setClock(100000);
+
+  lcd.init();
+  lcd.backlight();
+
+  // Стартовая boot animation
+  bootAnimation();
+
+  // Запускаем датчики после анимации
+  aht.begin();
+  bmp.begin(0x77);
+
+  // Читаем первые показания
+  readSensors();
+  lastSensor = millis();
+
+  // Показываем показания 20 секунд
+  lcdOn(true);
+  lcdUpdate();
+  delay(STARTUP_DISPLAY_TIME);
+
+  // После 20 секунд гасим экран и уходим в standby
+  enterStandby();
+
+  // Тест зелёного LED
+  digitalWrite(PIN_LED_GREEN, HIGH);
+  delay(500);
+  digitalWrite(PIN_LED_GREEN, LOW);
+
+  // Тест красного LED
+  digitalWrite(PIN_LED_RED, HIGH);
+  delay(500);
+  digitalWrite(PIN_LED_RED, LOW);
+}
+
+// ================= LOOP =================
+void loop() {
+  bool btn = buttonPressed();
+
+  switch (mode) {
+  case MODE_STANDBY:
+    handleStandby(btn);
+    break;
+
+  case MODE_ACTIVE:
+    handleActive(btn);
+    break;
+
+  case MODE_ALARM:
+    handleAlarm(btn);
+    break;
+  }
+}
