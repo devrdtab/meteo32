@@ -1,6 +1,6 @@
-# meteo32
+# Meteo32
 
-`meteo32` is firmware for a small indoor weather station based on the **ESP32-S3 DevKitC-1**.
+`Meteo32` is firmware for a small indoor weather station based on the **ESP32-S3 DevKitC-1**.
 
 The device measures temperature, humidity, and atmospheric pressure, shows the readings on a 16x2 I2C LCD display, and triggers an alarm when one of the measured values goes outside the configured safe range.
 
