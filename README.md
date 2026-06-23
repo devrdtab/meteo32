@@ -214,12 +214,3 @@ board = esp32-s3-devkitc-1
 framework = arduino
 monitor_speed = 115200
 ```
-
-## Possible Improvements
-
-- Add a real wiring photo.
-- Add a detailed schematic image.
-- Move alarm thresholds to a separate configuration file.
-- Add Wi-Fi data upload.
-- Add measurement history.
-- Design and print an enclosure.
