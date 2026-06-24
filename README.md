@@ -203,7 +203,7 @@ Serial Monitor speed:
 115200
 ```
 
-## Board Configuration
+## ESP Board Configuration
 
 The `platformio.ini` file uses this environment:
 
