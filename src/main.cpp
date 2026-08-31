@@ -1,1371 +1,458 @@
-#include <Arduino.h>
-#include <WiFi.h>
-#include <time.h>
-#include <Wire.h>
-#include <math.h>
-#include <Adafruit_AHTX0.h>
-#include <Adafruit_BMP280.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_AHTX0.h> // Подключает библиотеку для датчика температуры и влажности AHT.
+#include <Adafruit_BMP280.h> // Подключает библиотеку для датчика давления BMP280.
+#include <Arduino.h> // Подключает базовые функции Arduino: pinMode, digitalWrite, millis, delay и т.д.
+#include <LiquidCrystal_I2C.h> // Подключает библиотеку для LCD-дисплея через I2C.
+#include <Wire.h>              // Подключает библиотеку для работы с I2C-шиной.
 
-// =====================================================
-// WIFI
-// =====================================================
+// ================= PINS ================
+#define PIN_BTN 10      // Пин, к которому подключена кнопка.
+#define PIN_LED_STANDBY 5 // Пин зелёного светодиода.
+#define PIN_LED_RED 6   // Пин красного светодиода.
+#define PIN_BUZZER 13   // Пин зуммера.
 
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// ================= LCD =================
+#define LCD_WIDTH 16 // Количество символов в одной строке LCD.
+#define LCD_HEIGHT 2 // Количество строк LCD.
 
-// =====================================================
-// NTP / ЧАСОВОЙ ПОЯС
-// =====================================================
+// ================= CALIBRATION =========
+// Поправка температуры: от измерения отнимается 1.2 градуса.
+#define CAL_TEMP_OFFSET -1.2f
+// Поправка влажности: от измерения отнимается 1 процент.
+#define CAL_HUM_OFFSET -1.0f
+// Поправка давления: к измерению добавляется 10.9 hPa.
+#define CAL_PRES_OFFSET 10.9f
 
-const char* NTP_SERVER = "pool.ntp.org";
-const long GMT_OFFSET_SEC = 3 * 3600;
-const int DAYLIGHT_OFFSET_SEC = 0;
+// ================= THRESHOLDS ==========
+#define THRESHOLD_TEMP_MAX 26.0f   // Максимально допустимая температура.
+#define THRESHOLD_TEMP_MIN 19.0f   // Минимально допустимая температура.
+#define THRESHOLD_HUM_MAX 80.0f    // Максимально допустимая влажность.
+#define THRESHOLD_HUM_MIN 20.0f    // Минимально допустимая влажность.
+#define THRESHOLD_PRES_MAX 1015.0f // Максимально допустимое давление.
+#define THRESHOLD_PRES_MIN 1000.0f // Минимально допустимое давление.
 
-// =====================================================
-// I2C ПИНЫ ESP32-S3-DevKitC-1
-// =====================================================
+// ================= TIMING ==============
+// Как часто читать датчики в обычной работе: 10000 мс = 10 секунд.
+#define SENSOR_READ_PERIOD 20000UL
+// Сколько экран горит после нажатия кнопки: 5000 мс = 5 секунд.
+#define ACTIVE_DISPLAY_TIME 5000UL
+// Как часто мигать зелёным LED в ожидании: 7000 мс = 7 секунд.
+#define STANDBY_LED_PERIOD 20000UL
+// Как долго держать зелёный LED включённым при мигании: 10 мс.
+#define STANDBY_LED_PULSE 10UL
+// Период переключения красного LED в тревоге: 1000 мс.
+#define ALARM_LED_HALF_PERIOD 1000UL
+// Как часто запускать серию писков в тревоге: 3000 мс.
+#define ALARM_BUZZER_PERIOD 3000UL
+// Длительность одного писка: 100 мс.
+#define ALARM_BUZZER_PULSE 100UL
+// Пауза после отключения тревоги кнопкой: 3600000 мс = 1 час.
+#define ALARM_COOLDOWN 3600000UL
+// Сколько показывать показания после загрузки: 7000 мс = 7 секунд.
+#define STARTUP_DISPLAY_TIME 7000UL
 
-#define I2C_SDA 8
-#define I2C_SCL 9
-
-// =====================================================
-// OLED
-// =====================================================
-
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
-#define OLED_ADDR 0x3C
-
-Adafruit_SSD1306 display(
-  SCREEN_WIDTH,
-  SCREEN_HEIGHT,
-  &Wire,
-  -1
-);
-
-// =====================================================
-// ДАТЧИКИ
-// =====================================================
-
-Adafruit_AHTX0 aht;
-Adafruit_BMP280 bmp;
-
-bool ahtOk = false;
-bool bmpOk = false;
-
-// =====================================================
-// ОБНОВЛЕНИЕ ЭКРАНА
-// =====================================================
-
-const unsigned long UPDATE_INTERVAL = 1000;
-unsigned long lastUpdate = 0;
-
-// Длина заполненной части анимированной линии
-int lineProgress = 0;
-
-
-// =====================================================
-// СТРУКТУРА ФАЗЫ ЛУНЫ
-// =====================================================
-
-struct MoonInfo {
-  float phase;
-  float illumination;
-  const char* name;
+enum AppMode {  // Создаём список возможных режимов работы устройства.
+  MODE_STANDBY, // Режим ожидания: экран выключен, зелёный LED иногда
+                // мигает.
+  MODE_ACTIVE,  // Активный режим: экран включён и показывает показания.
+  MODE_ALARM    // Режим тревоги: красный LED мигает, зуммер пищит.
 };
 
+// ================= OBJECTS =================
+LiquidCrystal_I2C
+    lcd(0x27, LCD_WIDTH,
+        LCD_HEIGHT); // Создаёт объект LCD: адрес I2C 0x27, размер 16x2.
+Adafruit_AHTX0 aht;  // Создаёт объект датчика AHT.
+Adafruit_BMP280 bmp; // Создаёт объект датчика BMP280.
 
-// =====================================================
-// ПРОТОТИПЫ
-// =====================================================
+// ================= STATE =================
+AppMode mode =
+    MODE_STANDBY; // Переменная хранит текущий режим работы, сначала standby.
 
-void bootAnimation();
-void updateDisplay();
-MoonInfo getMoonPhase(time_t now);
-void drawMoon(int cx, int cy, int r, float phase);
-void drawMoonIndicator(int x, int y, float phase);
-void drawAnimatedLine();
+float t = 0, h = 0, p = 0; // Переменные для температуры, влажности и давления.
 
+bool aT =
+    false; // Флаг аварии температуры: true, если температура вышла за пределы.
+bool aH =
+    false; // Флаг аварии влажности: true, если влажность вышла за пределы.
+bool aP = false; // Флаг аварии давления: true, если давление вышло за пределы.
 
-// =====================================================
-// SETUP
-// =====================================================
+unsigned long lastSensor = 0;  // Время последнего чтения датчиков.
+unsigned long activeStart = 0; // Время входа в активный режим.
 
-void setup() {
-  Serial.begin(115200);
-  delay(200);
+unsigned long greenStart = 0; // Время включения зелёного LED.
+unsigned long greenLast = 0;  // Время последнего запуска мигания зелёного LED.
+bool greenOn = false;         // Состояние зелёного LED: включён или выключен.
 
-  // ===================================================
-  // I2C
-  // ===================================================
+unsigned long redLast = 0; // Время последнего переключения красного LED.
+bool redOn = false;        // Состояние красного LED: включён или выключен.
 
-  Wire.begin(
-    I2C_SDA,
-    I2C_SCL
-  );
+unsigned long buzzLast = 0;  // Время последней серии писков.
+unsigned long buzzStart = 0; // Время начала текущего писка или паузы.
+bool buzzOn = false;         // Состояние зуммера: пищит или молчит.
+int buzzCount = 0;           // Счётчик стадии серии писков.
 
-  // ===================================================
-  // OLED
-  // ===================================================
+bool cooldown = false;           // Флаг паузы после отключения тревоги кнопкой.
+unsigned long cooldownStart = 0; // Время начала cooldown.
 
-  if (!display.begin(
-        SSD1306_SWITCHCAPVCC,
-        OLED_ADDR
-      )) {
+// ================= BUTTON =================
+bool lastBtn = HIGH; // Предыдущее сырое состояние кнопки.
+bool stableBtn =
+    HIGH; // Последнее стабильное состояние кнопки после антидребезга.
+unsigned long btnTime = 0; // Время последнего изменения состояния кнопки.
 
-    Serial.println("SSD1306 не найден!");
+bool buttonPressed() { // Функция возвращает true один раз в момент нажатия
+                       // кнопки.
+  bool r = digitalRead(PIN_BTN); // Читаем текущее состояние кнопки.
+  bool pressed = false;          // По умолчанию считаем, что нажатия не было.
 
-    while (true) {
-      delay(1000);
-    }
+  if (r != lastBtn) {   // Если состояние кнопки изменилось.
+    btnTime = millis(); // Запоминаем время изменения.
+    lastBtn = r;        // Обновляем предыдущее состояние.
   }
 
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-  display.display();
+  if (millis() - btnTime > 50) { // Ждём 50 мс, чтобы убрать дребезг контактов.
+    if (r == LOW &&
+        stableBtn == HIGH) // Если кнопка стала нажатой, а раньше была отпущена.
+      pressed = true;      // Фиксируем одно нажатие.
 
-  // ===================================================
-  // СТАРТОВАЯ АНИМАЦИЯ
-  // ===================================================
-
-  bootAnimation();
-
-  // ===================================================
-  // NTP
-  // ===================================================
-
-  configTime(
-    GMT_OFFSET_SEC,
-    DAYLIGHT_OFFSET_SEC,
-    NTP_SERVER
-  );
-
-  // ===================================================
-  // AHT20
-  // ===================================================
-
-  ahtOk = aht.begin();
-
-  if (!ahtOk) {
-    Serial.println("AHT20 не найден!");
-  } else {
-    Serial.println("AHT20 OK");
+    stableBtn = r; // Обновляем стабильное состояние кнопки.
   }
 
-  // ===================================================
-  // BMP280
-  // ===================================================
-
-  bmpOk = bmp.begin(0x76);
-
-  if (!bmpOk) {
-    bmpOk = bmp.begin(0x77);
-  }
-
-  if (!bmpOk) {
-
-    Serial.println("BMP280 не найден!");
-
-  } else {
-
-    Serial.println("BMP280 OK");
-
-    bmp.setSampling(
-      Adafruit_BMP280::MODE_NORMAL,
-      Adafruit_BMP280::SAMPLING_X2,
-      Adafruit_BMP280::SAMPLING_X16,
-      Adafruit_BMP280::FILTER_X16,
-      Adafruit_BMP280::STANDBY_MS_500
-    );
-  }
-
-  // ===================================================
-  // ПЕРВЫЙ ВЫВОД
-  // ===================================================
-
-  updateDisplay();
-
-  lastUpdate = millis();
+  return pressed; // Возвращаем результат: было новое нажатие или нет.
 }
 
-
-// =====================================================
-// LOOP
-// =====================================================
-
-void loop() {
-
-  if (
-    millis() - lastUpdate >=
-    UPDATE_INTERVAL
-  ) {
-
-    lastUpdate = millis();
-
-    updateDisplay();
+// ================= DISPLAY =================
+void clearLine(int line) { // Функция очищает одну строку LCD.
+  lcd.setCursor(0, line);  // Ставим курсор в начало выбранной строки.
+  for (int i = 0; i < LCD_WIDTH; i++) { // Проходим по всем символам строки.
+    lcd.print(" "); // Печатаем пробел, затирая старый символ.
   }
+  lcd.setCursor(0, line); // Возвращаем курсор в начало очищенной строки.
 }
 
+void bootAnimation() {        // Стартовая анимация загрузки.
+  const int totalSteps = 100; // Всего 100 шагов, от 0% до 100%.
+  const int lcdDelay = 10;    // Пауза между шагами анимации: 20 мс.
+  int ledState = LOW; // Текущее состояние зелёного LED во время загрузки.
+  unsigned long lastBlink = 0; // Время последнего переключения зелёного LED.
 
-// =====================================================
-// СТАРТОВАЯ АНИМАЦИЯ
-// =====================================================
+  lcd.display();   // Включаем вывод символов на LCD.
+  lcd.backlight(); // Включаем подсветку LCD.
+  clearLine(0);    // Очищаем первую строку.
+  clearLine(1);    // Очищаем вторую строку.
 
-void bootAnimation() {
+  for (int percent = 0; percent <= totalSteps;
+       percent++) { // Цикл от 0 до 100 процентов.
+    int charsToFill = (percent * LCD_WIDTH) /
+                      100; // Считаем, сколько символов прогресс-бара заполнить.
 
-  const int totalSteps = 100;
-
-  // Скорость обычных этапов
-  const int animationDelay = 20;
-
-  // Максимальное время подключения WiFi
-  const unsigned long WIFI_TIMEOUT = 10000;
-
-  bool wifiStarted = false;
-  bool wifiFinished = false;
-
-  unsigned long wifiStartTime = 0;
-
-  display.clearDisplay();
-  display.setTextColor(SSD1306_WHITE);
-  display.setTextSize(1);
-
-  // ===================================================
-  // АНИМАЦИЯ 0-100%
-  // ===================================================
-
-  for (
-    int percent = 0;
-    percent <= totalSteps;
-    percent++
-  ) {
-
-    // =================================================
-    // ЗАПУСК WIFI НА 50%
-    // =================================================
-
-    if (
-      percent >= 50 &&
-      !wifiStarted
-    ) {
-
-      wifiStarted = true;
-
-      wifiStartTime = millis();
-
-      WiFi.mode(WIFI_STA);
-
-      WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASS
-      );
-
-      Serial.println();
-      Serial.println("Подключение к WiFi...");
+    lcd.setCursor(0, 0); // Ставим курсор в начало первой строки.
+    for (int i = 0; i < LCD_WIDTH;
+         i++) { // Проходим по всем позициям первой строки.
+      lcd.write(i < charsToFill ? (uint8_t)255
+                                : ' '); // Печатаем полный блок или пробел.
     }
 
-    // =================================================
-    // ПРОВЕРКА WIFI
-    // =================================================
+    lcd.setCursor(0, 1);    // Ставим курсор в начало второй строки.
+    lcd.print("Loading: "); // Печатаем текст загрузки.
+    if (percent < 10)       // Если процент однозначный.
+      lcd.print(" ");       // Добавляем пробел для ровного выравнивания.
+    lcd.print(percent);     // Печатаем число процентов.
+    lcd.print("%   "); // Печатаем знак процента и пробелы, чтобы стереть старые
+                       // символы.
 
-    if (
-      wifiStarted &&
-      !wifiFinished
-    ) {
-
-      if (
-        WiFi.status() ==
-        WL_CONNECTED
-      ) {
-
-        wifiFinished = true;
-
-        Serial.println(
-          "WiFi подключен: " +
-          WiFi.localIP().toString()
-        );
-
-      } else if (
-        millis() - wifiStartTime >=
-        WIFI_TIMEOUT
-      ) {
-
-        wifiFinished = true;
-
-        Serial.println(
-          "WiFi: таймаут 10 секунд"
-        );
-      }
+    int blinkInterval = map(percent, 0, totalSteps, 800,
+                            20); // Чем больше процент, тем быстрее мигает LED.
+    if (millis() - lastBlink >=
+        (unsigned long)blinkInterval) { // Проверяем, пора ли переключить LED.
+      ledState = !ledState;             // Инвертируем состояние LED.
+      digitalWrite(PIN_LED_STANDBY,
+                   ledState); // Записываем новое состояние на зелёный LED.
+      lastBlink = millis();   // Запоминаем время переключения.
     }
 
-    // =================================================
-    // ШИРИНА ПРОГРЕСС-БАРА
-    // =================================================
-
-    int barWidth = map(
-      percent,
-      0,
-      totalSteps,
-      0,
-      SCREEN_WIDTH - 8
-    );
-
-    // =================================================
-    // ОЧИСТКА
-    // =================================================
-
-    display.clearDisplay();
-
-    // =================================================
-    // ЗАГОЛОВОК
-    // =================================================
-
-    display.setCursor(
-      4,
-      2
-    );
-
-// display.setTextSize(1);
-// display.setCursor(19, 2);
-// display.print("DESKTOP WEATHER");
-
-display.setTextSize(1);
-
-const char* title = "DESKTOP WEATHER";
-
-int16_t x1, y1;
-uint16_t w, h;
-
-display.getTextBounds(
-  title,
-  0,
-  2,
-  &x1,
-  &y1,
-  &w,
-  &h
-);
-
-int16_t x = (SCREEN_WIDTH - w) / 2;
-
-display.setCursor(
-  x,
-  2
-);
-
-display.print(title);
-
-
-    // =================================================
-    // ПРОЦЕНТ
-    // =================================================
-
-    display.setCursor(
-      0,
-      24
-    );
-
-    display.print(
-      "Loading:"
-    );
-
-    if (percent < 10) {
-      display.print("  ");
-    } else if (percent < 100) {
-      display.print(" ");
-    }
-
-    display.print(
-      percent
-    );
-
-    display.print(
-      "%"
-    );
-
-    // =================================================
-    // РАМКА ПРОГРЕСС-БАРА
-    // =================================================
-
-    display.drawRect(
-      4,
-      36,
-      SCREEN_WIDTH - 8,
-      10,
-      SSD1306_WHITE
-    );
-
-    // =================================================
-    // ЗАПОЛНЕНИЕ ПРОГРЕСС-БАРА
-    // =================================================
-
-    if (barWidth > 0) {
-
-      display.fillRect(
-        5,
-        37,
-        barWidth - 1,
-        8,
-        SSD1306_WHITE
-      );
-    }
-
-    // =================================================
-    // БЕГУЩАЯ ТОЧКА
-    // =================================================
-
-    int dotX =
-      4 +
-      (percent * (SCREEN_WIDTH - 8)) /
-      100;
-
-    if (dotX > 123) {
-      dotX = 123;
-    }
-
-    display.fillCircle(
-      dotX,
-      52,
-      0.5,
-      SSD1306_WHITE
-    );
-
-    // =================================================
-    // ТЕКСТ ЭТАПА
-    // =================================================
-
-    display.setCursor(
-      0,
-      57
-    );
-
-    if (percent < 25) {
-
-      display.print(
-        "Starting.."
-      );
-
-    } else if (percent < 50) {
-
-      display.print(
-        "Get sensors..."
-      );
-
-    } else if (percent < 70) {
-
-      display.print(
-        "Connecting WiFi"
-      );
-
-      if (
-        WiFi.status() ==
-        WL_CONNECTED
-      ) {
-
-        display.print(
-          " OK"
-        );
-
-      } else {
-
-        int dots =
-          (millis() / 300) % 4;
-
-        for (
-          int i = 0;
-          i < dots;
-          i++
-        ) {
-          display.print(".");
-        }
-      }
-
-    } else if (percent < 90) {
-
-
-      display.print(
-        "Initializing...."
-      );
-
-    } else if (percent < 100) {
-
-      display.print(
-        "Almost done......"
-      );
-
-    } else {
-
-      display.print(
-        "READY"
-      );
-    }
-
-    // =================================================
-    // WIFI СТАТУС
-    // =================================================
-
-
-    display.display();
-
-    // =================================================
-    // ЕСЛИ WIFI ПОДКЛЮЧАЕТСЯ
-    // =================================================
-
-    if (
-      percent >= 50 &&
-      percent < 70 &&
-      !wifiFinished
-    ) {
-
-      // Пока WiFi не подключен,
-      // остаёмся на текущем проценте.
-
-      percent--;
-
-      delay(100);
-
-      continue;
-    }
-
-    // =================================================
-    // ОБЫЧНАЯ СКОРОСТЬ АНИМАЦИИ
-    // =================================================
-
-    delay(
-      animationDelay
-    );
+    delay(lcdDelay); // Делаем паузу, чтобы анимация была видимой.
   }
 
-  // ===================================================
-  // READY
-  // ===================================================
-
-  delay(500);
+  digitalWrite(PIN_LED_STANDBY, LOW); // После загрузки выключаем зелёный LED.
+  clearLine(0);                     // Очищаем первую строку.
+  clearLine(1);                     // Очищаем вторую строку.
 }
 
+void lcdUpdate() { // Функция обновляет показания на LCD.
+  lcd.clear();     // Полностью очищает экран.
 
-// =====================================================
-// РАСЧЁТ ФАЗЫ ЛУНЫ
-// =====================================================
+  lcd.setCursor(0, 0); // Переходит на первую строку.
 
-MoonInfo getMoonPhase(
-  time_t now
-) {
+  lcd.print(aT ? "*"
+               : " "); // Если авария температуры, печатает *, иначе пробел.
+  lcd.print("T:");     // Печатает подпись температуры.
+  lcd.print(t, 1);     // Печатает температуру с одним знаком после запятой.
+  lcd.print("C ");     // Печатает единицу измерения температуры.
 
-  const double SYNODIC_MONTH =
-    29.530588853;
+  lcd.print(aH ? "*" : " "); // Если авария влажности, печатает *, иначе пробел.
+  lcd.print("H:");           // Печатает подпись влажности.
+  lcd.print((int)h);         // Печатает влажность целым числом.
+  lcd.print("%");            // Печатает знак процента.
 
-  const double KNOWN_NEW_MOON =
-    2451550.1;
+  lcd.setCursor(0, 1); // Переходит на вторую строку.
 
-  double jd =
-    ((double)now / 86400.0) +
-    2440587.5;
-
-  double days =
-    jd - KNOWN_NEW_MOON;
-
-  double moonAge =
-    fmod(
-      days,
-      SYNODIC_MONTH
-    );
-
-  if (moonAge < 0) {
-    moonAge += SYNODIC_MONTH;
-  }
-
-  float phase =
-    moonAge /
-    SYNODIC_MONTH;
-
-  // ===================================================
-  // ОСВЕЩЁННОСТЬ
-  // ===================================================
-
-  float illumination =
-    (1.0 -
-     cos(
-       2.0 *
-       PI *
-       phase
-     )) *
-    50.0;
-
-  const char* name;
-
-  // ===================================================
-  // НАЗВАНИЕ ФАЗЫ
-  // ===================================================
-
-  if (
-    phase < 0.0625 ||
-    phase >= 0.9375
-  ) {
-
-    name = "NEW";
-
-  } else if (
-    phase < 0.1875
-  ) {
-
-    name = "CRES";
-
-  } else if (
-    phase < 0.3125
-  ) {
-
-    name = "1/4";
-
-  } else if (
-    phase < 0.4375
-  ) {
-
-    name = "GIB";
-
-  } else if (
-    phase < 0.5625
-  ) {
-
-    name = "FULL";
-
-  } else if (
-    phase < 0.6875
-  ) {
-
-    name = "GIB";
-
-  } else if (
-    phase < 0.8125
-  ) {
-
-    name = "3/4";
-
-  } else {
-
-    name = "CRES";
-  }
-
-  MoonInfo result;
-
-  result.phase =
-    phase;
-
-  result.illumination =
-    illumination;
-
-  result.name =
-    name;
-
-  return result;
+  lcd.print(aP ? "*" : " "); // Если авария давления, печатает *, иначе пробел.
+  lcd.print("P:");           // Печатает подпись давления.
+  lcd.print((int)p);         // Печатает давление целым числом.
+  lcd.print("hPa");          // Печатает единицу давления.
 }
 
-
-// =====================================================
-// РИСОВАНИЕ ЛУНЫ
-// =====================================================
-
-void drawMoon(
-  int cx,
-  int cy,
-  int r,
-  float phase
-) {
-
-  // ===================================================
-  // НОВОЛУНИЕ
-  // ===================================================
-
-  if (
-    phase < 0.03 ||
-    phase > 0.97
-  ) {
-
-    display.drawCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // ПОЛНОЛУНИЕ
-  // ===================================================
-
-  if (
-    phase > 0.47 &&
-    phase < 0.53
-  ) {
-
-    display.fillCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // ПЕРВАЯ ЧЕТВЕРТЬ
-  // ===================================================
-
-  if (
-    phase >= 0.22 &&
-    phase < 0.28
-  ) {
-
-    display.fillCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    display.fillRect(
-      cx - r,
-      cy - r,
-      r,
-      r * 2 + 1,
-      SSD1306_BLACK
-    );
-
-    display.drawCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // ПОСЛЕДНЯЯ ЧЕТВЕРТЬ
-  // ===================================================
-
-  if (
-    phase >= 0.72 &&
-    phase < 0.78
-  ) {
-
-    display.fillCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    display.fillRect(
-      cx,
-      cy - r,
-      r + 1,
-      r * 2 + 1,
-      SSD1306_BLACK
-    );
-
-    display.drawCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // РАСТУЩАЯ ЛУНА
-  // ===================================================
-
-  if (
-    phase < 0.5
-  ) {
-
-    display.fillCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    display.fillCircle(
-      cx - 5,
-      cy,
-      r,
-      SSD1306_BLACK
-    );
-
-    display.drawCircle(
-      cx,
-      cy,
-      r,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // УБЫВАЮЩАЯ ЛУНА
-  // ===================================================
-
-  display.fillCircle(
-    cx,
-    cy,
-    r,
-    SSD1306_WHITE
-  );
-
-  display.fillCircle(
-    cx + 5,
-    cy,
-    r,
-    SSD1306_BLACK
-  );
-
-  display.drawCircle(
-    cx,
-    cy,
-    r,
-    SSD1306_WHITE
-  );
-}
-
-
-// =====================================================
-// СТРЕЛКА / ТОЧКА ФАЗЫ ЛУНЫ
-// =====================================================
-
-void drawMoonIndicator(
-  int x,
-  int y,
-  float phase
-) {
-
-  // ===================================================
-  // НОВОЛУНИЕ — ПУСТАЯ ТОЧКА
-  // ===================================================
-
-  if (
-    phase < 0.0625 ||
-    phase >= 0.9375
-  ) {
-
-    display.drawCircle(
-      x + 3,
-      y + 3,
-      3,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // ПОЛНОЛУНИЕ — ЖИРНАЯ ТОЧКА
-  // ===================================================
-
-  if (
-    phase >= 0.4375 &&
-    phase < 0.5625
-  ) {
-
-    display.fillCircle(
-      x + 3,
-      y + 3,
-      3,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // РАСТУЩАЯ — СТРЕЛКА ВВЕРХ
-  // ===================================================
-
-  if (
-    phase < 0.5
-  ) {
-
-    display.drawLine(
-      x + 3,
-      y + 7,
-      x + 3,
-      y,
-      SSD1306_WHITE
-    );
-
-    display.drawLine(
-      x + 3,
-      y,
-      x,
-      y + 3,
-      SSD1306_WHITE
-    );
-
-    display.drawLine(
-      x + 3,
-      y,
-      x + 6,
-      y + 3,
-      SSD1306_WHITE
-    );
-
-    return;
-  }
-
-  // ===================================================
-  // УБЫВАЮЩАЯ — СТРЕЛКА ВНИЗ
-  // ===================================================
-
-  display.drawLine(
-    x + 3,
-    y,
-    x + 3,
-    y + 7,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    x + 3,
-    y + 7,
-    x,
-    y + 4,
-    SSD1306_WHITE
-  );
-
-  display.drawLine(
-    x + 3,
-    y + 7,
-    x + 6,
-    y + 4,
-    SSD1306_WHITE
-  );
-}
-
-
-// =====================================================
-// АНИМИРОВАННАЯ ПУНКТИРНАЯ ЛИНИЯ
-// =====================================================
-
-void drawAnimatedLine() {
-
-  // ===================================================
-  // ПУНКТИР ПО ВСЕЙ ШИРИНЕ
-  // ===================================================
-
-  // Формат:
-  //
-  // ██  ██  ██  ██  ██  ██
-  //
-  // 2 пикселя линия
-  // 2 пикселя пробел
-
-  for (
-    int x = 0;
-    x < SCREEN_WIDTH;
-    x += 4
-  ) {
-
-    display.drawFastHLine(
-      x,
-      10,
-      2,
-      SSD1306_WHITE
-    );
-  }
-
-  // ===================================================
-  // ЗАПОЛНЕННАЯ ЧАСТЬ
-  // ===================================================
-
-  if (
-    lineProgress > 0
-  ) {
-
-    display.drawFastHLine(
-      0,
-      10,
-      lineProgress,
-      SSD1306_WHITE
-    );
+void lcdOn(bool on) {  // Функция включает или выключает LCD.
+  if (on) {            // Если передали true.
+    lcd.display();     // Включаем отображение символов.
+    lcd.backlight();   // Включаем подсветку.
+  } else {             // Если передали false.
+    lcd.noDisplay();   // Выключаем отображение символов.
+    lcd.noBacklight(); // Выключаем подсветку.
   }
 }
 
+// ================= SENSORS =================
+void readSensors() {        // Функция читает датчики и проверяет аварии.
+  sensors_event_t h_e, t_e; // Создаём структуры для влажности и температуры.
 
-// =====================================================
-// ОБНОВЛЕНИЕ ДИСПЛЕЯ
-// =====================================================
-
-void updateDisplay() {
-
-  // ===================================================
-  // ПОКАЗАНИЯ ДАТЧИКОВ
-  // ===================================================
-
-  float temperature = NAN;
-  float humidity = NAN;
-  float pressure = NAN;
-
-  // ===================================================
-  // AHT20
-  // ===================================================
-
-  if (ahtOk) {
-
-    sensors_event_t humEvent;
-    sensors_event_t tempEvent;
-
-    aht.getEvent(
-      &humEvent,
-      &tempEvent
-    );
-
-    temperature =
-      tempEvent.temperature;
-
-    humidity =
-      humEvent.relative_humidity;
+  if (aht.getEvent(&h_e, &t_e)) {          // Читаем AHT; если чтение успешно.
+    t = t_e.temperature + CAL_TEMP_OFFSET; // Сохраняем температуру с поправкой.
+    h = h_e.relative_humidity +
+        CAL_HUM_OFFSET; // Сохраняем влажность с поправкой.
   }
 
-  // ===================================================
-  // BMP280
-  // ===================================================
+  p = bmp.readPressure() / 100.0f +
+      CAL_PRES_OFFSET; // Читаем давление, переводим Па в hPa и добавляем
+                       // поправку.
 
-  if (bmpOk) {
+  aT = (t > THRESHOLD_TEMP_MAX ||
+        t < THRESHOLD_TEMP_MIN); // Проверяем, вышла ли температура за пределы.
+  aH = (h > THRESHOLD_HUM_MAX ||
+        h < THRESHOLD_HUM_MIN); // Проверяем, вышла ли влажность за пределы.
+  aP = (p > THRESHOLD_PRES_MAX ||
+        p < THRESHOLD_PRES_MIN); // Проверяем, вышло ли давление за пределы.
 
-    pressure =
-      bmp.readPressure() /
-      100.0F;
+  Serial.printf("T=%.1f H=%.1f P=%.1f\n", t, h,
+                p); // Отправляем показания в Serial Monitor.
+}
 
-    if (!ahtOk) {
+bool alarm() {
+  return aT || aH || aP;
+} // Возвращает true, если есть хотя бы одна авария.
 
-      temperature =
-        bmp.readTemperature();
+// ================= MODES =================
+void enterStandby() {  // Переводит устройство в режим ожидания.
+  mode = MODE_STANDBY; // Устанавливает текущий режим standby.
+  lcdOn(false);        // Выключает экран.
+
+  digitalWrite(PIN_LED_RED, LOW); // Выключает красный LED.
+  digitalWrite(PIN_BUZZER, LOW);  // Выключает зуммер.
+
+  greenOn = false; // Сбрасывает флаг зелёного LED.
+  greenLast =
+      millis() -
+      STANDBY_LED_PERIOD; // Делает так, чтобы первый зелёный импульс был сразу.
+}
+
+void enterActive() {  // Переводит устройство в активный режим.
+  mode = MODE_ACTIVE; // Устанавливает текущий режим active.
+  lcdOn(true);        // Включает экран.
+
+  readSensors(); // Сразу читает свежие данные с датчиков.
+  lcdUpdate();   // Показывает эти данные на LCD.
+
+  activeStart = millis(); // Запоминает время входа в active.
+}
+
+void enterAlarm() {  // Переводит устройство в режим тревоги.
+  mode = MODE_ALARM; // Устанавливает текущий режим alarm.
+  lcdOn(false);      // Выключает экран в тревоге.
+
+  redOn = false;  // Сбрасывает состояние красного LED.
+  buzzOn = false; // Сбрасывает состояние зуммера.
+  buzzCount = 0;  // Сбрасывает счётчик писков.
+
+  digitalWrite(PIN_LED_RED, LOW); // Выключает красный LED.
+  digitalWrite(PIN_BUZZER, LOW);  // Выключает зуммер.
+}
+
+// ================= HANDLERS =================
+void handleStandby(bool btn) {  // Обрабатывает поведение в режиме standby.
+  unsigned long now = millis(); // Запоминает текущее время.
+
+  if (!greenOn &&
+      now - greenLast >= STANDBY_LED_PERIOD) { // Если зелёный LED выключен и
+                                               // пришло время мигнуть.
+    digitalWrite(PIN_LED_STANDBY, HIGH);         // Включает зелёный LED.
+    greenOn = true;                            // Запоминает, что LED включён.
+    greenStart = now;                          // Запоминает время включения.
+    greenLast = now; // Запоминает время последнего запуска импульса.
+  }
+
+  if (greenOn &&
+      now - greenStart >=
+          STANDBY_LED_PULSE) { // Если зелёный LED горит достаточно долго.
+    digitalWrite(PIN_LED_STANDBY, LOW); // Выключает зелёный LED.
+    greenOn = false;                  // Запоминает, что LED выключен.
+  }
+
+  if (now - lastSensor >
+      SENSOR_READ_PERIOD) { // Если пора снова прочитать датчики.
+    lastSensor = now;       // Обновляет время последнего чтения.
+    readSensors();          // Читает датчики.
+
+    if (cooldown &&
+        now - cooldownStart >=
+            ALARM_COOLDOWN) { // Если cooldown включён и уже прошёл час.
+      cooldown = false; // Выключает cooldown, тревога снова может сработать.
+    }
+
+    if (alarm() && !cooldown) { // Если есть авария и cooldown не активен.
+      enterAlarm();             // Переходит в режим тревоги.
+      return; // Выходит из функции, чтобы дальше standby не выполнялся.
     }
   }
 
-  // ===================================================
-  // ДАТА / ДЕНЬ / ВРЕМЯ
-  // ===================================================
+  if (btn)         // Если кнопка была нажата.
+    enterActive(); // Переходит в активный режим.
+}
 
-  char dateStr[9] =
-    "-- -- --";
+void handleActive(bool btn) {   // Обрабатывает поведение в активном режиме.
+  unsigned long now = millis(); // Запоминает текущее время.
 
-  char dayStr[4] =
-    "---";
-
-  char timeStr[6] =
-    "--:--";
-
-  struct tm timeinfo;
-
-  if (
-    getLocalTime(
-      &timeinfo,
-      1000
-    )
-  ) {
-
-    strftime(
-      dateStr,
-      sizeof(dateStr),
-      "%d-%m-%y",
-      &timeinfo
-    );
-
-    strftime(
-      dayStr,
-      sizeof(dayStr),
-      "%a",
-      &timeinfo
-    );
-
-    strftime(
-      timeStr,
-      sizeof(timeStr),
-      "%H:%M",
-      &timeinfo
-    );
+  if (now - lastSensor > SENSOR_READ_PERIOD) { // Если пора обновить показания.
+    lastSensor = now; // Обновляет время последнего чтения.
+    readSensors();    // Читает датчики.
+    lcdUpdate();      // Обновляет LCD.
   }
 
-  // ===================================================
-  // ФАЗА ЛУНЫ
-  // ===================================================
-
-  time_t now =
-    time(nullptr);
-
-  MoonInfo moon =
-    getMoonPhase(
-      now
-    );
-
-  // ===================================================
-  // SERIAL MONITOR
-  // ===================================================
-
-  Serial.printf(
-    "%s %s %s  T=%.1fC H=%.1f%% P=%.1fhPa Moon=%s %.0f%%\n",
-    dateStr,
-    dayStr,
-    timeStr,
-    temperature,
-    humidity,
-    pressure,
-    moon.name,
-    moon.illumination
-  );
-
-  // ===================================================
-  // ОЧИСТКА ЭКРАНА
-  // ===================================================
-
-  display.clearDisplay();
-
-  display.setTextColor(
-    SSD1306_WHITE
-  );
-
-  display.setTextSize(1);
-
-  // ===================================================
-  // ВЕРХНЯЯ ОБЛАСТЬ
-  // ===================================================
-
-  // Дата слева
-  display.setCursor(
-    0,
-    0
-  );
-
-  display.print(
-    dateStr
-  );
-
-  // День недели по центру
-  display.setCursor(
-    55,
-    0
-  );
-
-  display.print(
-    dayStr
-  );
-
-  // Время справа
-  display.setCursor(
-    98,
-    0
-  );
-
-  display.print(
-    timeStr
-  );
-
-  // ===================================================
-  // ПУНКТИРНАЯ АНИМИРОВАННАЯ ЛИНИЯ
-  // ===================================================
-
-  drawAnimatedLine();
-
-  // ===================================================
-  // ВЕРТИКАЛЬНАЯ ЛИНИЯ
-  // ===================================================
-
-  display.drawFastVLine(
-    64,
-    16,
-    48,
-    SSD1306_WHITE
-  );
-
-  // ===================================================
-  // ГОРИЗОНТАЛЬНЫЕ ЛИНИИ
-  // ===================================================
-
-  display.drawFastHLine(
-    0,
-    37,
-    64,
-    SSD1306_WHITE
-  );
-
-  display.drawFastHLine(
-    65,
-    37,
-    63,
-    SSD1306_WHITE
-  );
-
-  // ===================================================
-  // ЛЕВАЯ ВЕРХНЯЯ ЗОНА — ТЕМПЕРАТУРА
-  // ===================================================
-
-  display.setTextSize(1);
-
-  display.setCursor(
-    4,
-    17
-  );
-
-  display.print(
-    "Temp:"
-  );
-
-  display.setCursor(
-    2,
-    28
-  );
-
-  if (
-    !isnan(temperature)
-  ) {
-
-    display.printf(
-      "%.1fC",
-      temperature
-    );
-
-  } else {
-
-    display.print(
-      "--.-C"
-    );
+  if (btn) {                // Если нажали кнопку в active.
+    activeStart = millis(); // Продлевает время active-режима.
+    readSensors();          // Читает свежие данные.
+    lcdUpdate();            // Сразу обновляет экран.
   }
 
-  // ===================================================
-  // ПРАВАЯ ВЕРХНЯЯ ЗОНА — ДАВЛЕНИЕ
-  // ===================================================
+  if (now - activeStart > ACTIVE_DISPLAY_TIME) { // Если active-режим длится
+                                                 // дольше разрешённого времени.
+    enterStandby(); // Возвращается в режим ожидания.
+  }
+}
 
-  display.setCursor(
-    68,
-    16
-  );
+void handleAlarm(bool btn) {    // Обрабатывает поведение в режиме тревоги.
+  unsigned long now = millis(); // Запоминает текущее время.
 
-  display.print(
-    "Pressure:"
-  );
-
-  display.setCursor(
-    68,
-    27
-  );
-
-  if (
-    !isnan(pressure)
-  ) {
-
-    display.printf(
-      "%.0f hPa",
-      pressure
-    );
-
-  } else {
-
-    display.print(
-      "-- hPa"
-    );
+  if (now - redLast >
+      ALARM_LED_HALF_PERIOD) { // Если пора переключить красный LED.
+    redOn = !redOn;            // Инвертирует состояние красного LED.
+    digitalWrite(PIN_LED_RED,
+                 redOn); // Записывает новое состояние на пин красного LED.
+    redLast = now;       // Запоминает время переключения.
   }
 
-  // ===================================================
-  // ЛЕВАЯ НИЖНЯЯ ЗОНА — ФАЗА ЛУНЫ
-  // ===================================================
-
-  drawMoon(
-    10,
-    51,
-    7,
-    moon.phase
-  );
-
-  // Название фазы
-  display.setCursor(
-    22,
-    45
-  );
-
-  display.print(
-    moon.name
-  );
-
-  // Освещённость
-  display.setCursor(
-    22,
-    55
-  );
-
-  display.printf(
-    "%.0f%%",
-    moon.illumination
-  );
-
-  // Стрелка / точка
-  drawMoonIndicator(
-    47,
-    53,
-    moon.phase
-  );
-
-  // ===================================================
-  // ПРАВАЯ НИЖНЯЯ ЗОНА — ВЛАЖНОСТЬ
-  // ===================================================
-
-  display.setCursor(
-    68,
-    42
-  );
-
-  display.print(
-    "Humidity:"
-  );
-
-  display.setCursor(
-    68,
-    53
-  );
-
-  if (
-    !isnan(humidity)
-  ) {
-
-    display.printf(
-      "%.0f%%",
-      humidity
-    );
-
-  } else {
-
-    display.print(
-      "--%"
-    );
+  if (!buzzOn && buzzCount == 0 &&
+      now - buzzLast >
+          ALARM_BUZZER_PERIOD) {    // Если пора начать новую серию писков.
+    digitalWrite(PIN_BUZZER, HIGH); // Включает зуммер.
+    buzzOn = true;                  // Запоминает, что зуммер включён.
+    buzzStart = now;                // Запоминает время начала писка.
+    buzzCount = 1;                  // Отмечает, что идёт первый писк.
   }
 
-  // ===================================================
-  // ОБНОВЛЕНИЕ АНИМИРОВАННОЙ ЛИНИИ
-  // ===================================================
+  if (buzzOn &&
+      now - buzzStart >
+          ALARM_BUZZER_PULSE) {    // Если текущий писк уже достаточно длинный.
+    digitalWrite(PIN_BUZZER, LOW); // Выключает зуммер.
+    buzzOn = false;                // Запоминает, что зуммер выключен.
 
-  lineProgress += 4;
-
-  if (
-    lineProgress >= SCREEN_WIDTH
-  ) {
-
-    lineProgress = 0;
+    if (buzzCount == 1) { // Если закончился первый писк.
+      buzzCount = 2;      // Переходит к паузе перед вторым писком.
+      buzzStart = now;    // Запоминает начало паузы.
+    } else {              // Если закончился второй писк.
+      buzzCount = 0;      // Сбрасывает серию.
+      buzzLast = now;     // Запоминает время окончания серии.
+    }
   }
 
-  // ===================================================
-  // ВЫВОД НА OLED
-  // ===================================================
+  if (!buzzOn && buzzCount == 2 &&
+      now - buzzStart >
+          ALARM_BUZZER_PULSE) { // Если пауза перед вторым писком закончилась.
+    digitalWrite(PIN_BUZZER, HIGH); // Включает второй писк.
+    buzzOn = true;                  // Запоминает, что зуммер включён.
+    buzzStart = now;                // Запоминает время начала второго писка.
+    buzzCount = 3;                  // Отмечает, что второй писк идёт.
+  }
 
-  display.display();
+  if (btn) { // Если нажали кнопку в тревоге.
+    cooldown =
+        true; // Включает cooldown, чтобы тревога не включилась сразу снова.
+    cooldownStart = now; // Запоминает начало cooldown.
+    enterActive();       // Переходит в active и показывает показания.
+  }
+}
+
+// ================= SETUP =================
+void setup() { // setup выполняется один раз при включении или перезагрузке
+               // платы.
+  Serial.begin(115200); // Запускает Serial Monitor на скорости 115200.
+
+  delay(500); // Небольшая пауза для стабилизации питания и устройств.
+
+  pinMode(PIN_LED_STANDBY, OUTPUT); // Настраивает зелёный LED как выход.
+  pinMode(PIN_LED_RED, OUTPUT);   // Настраивает красный LED как выход.
+  pinMode(PIN_BUZZER, OUTPUT);    // Настраивает зуммер как выход.
+  pinMode(PIN_BTN, INPUT_PULLUP); // Настраивает кнопку как вход с внутренней
+                                  // подтяжкой к плюсу.
+
+  digitalWrite(PIN_LED_STANDBY, LOW); // Выключает зелёный LED на старте.
+  digitalWrite(PIN_LED_RED, LOW);   // Выключает красный LED на старте.
+  digitalWrite(PIN_BUZZER, LOW);    // Выключает зуммер на старте.
+
+  Wire.begin(8, 9);      // Запускает I2C: SDA на пине 8, SCL на пине 9.
+  Wire.setClock(100000); // Устанавливает скорость I2C 100 кГц.
+
+  lcd.init();      // Инициализирует LCD-дисплей.
+  lcd.backlight(); // Включает подсветку LCD.
+
+  bootAnimation(); // Показывает стартовую анимацию загрузки.
+
+  aht.begin();     // Инициализирует датчик AHT.
+  bmp.begin(0x77); // Инициализирует BMP280 по адресу 0x77.
+
+  readSensors();         // Читает первые показания датчиков.
+  lastSensor = millis(); // Запоминает время первого чтения.
+
+  lcdOn(true);                 // Включает экран после загрузки.
+  lcdUpdate();                 // Показывает первые показания на экране.
+  delay(STARTUP_DISPLAY_TIME); // Держит показания на экране заданное время.
+
+  enterStandby(); // После показа переходит в standby и гасит экран.
+
+  digitalWrite(PIN_LED_STANDBY, HIGH); // Включает зелёный LED для теста.
+  delay(500); // Держит зелёный LED включённым 0.5 секунды.
+  digitalWrite(PIN_LED_STANDBY, LOW); // Выключает зелёный LED после теста.
+
+  digitalWrite(PIN_LED_RED, HIGH); // Включает красный LED для теста.
+  delay(500);                      // Держит красный LED включённым 0.5 секунды.
+  digitalWrite(PIN_LED_RED, LOW);  // Выключает красный LED после теста.
+}
+
+// ================= LOOP =================
+void loop() {                 // loop выполняется бесконечно после setup.
+  bool btn = buttonPressed(); // Проверяет, была ли нажата кнопка.
+
+  switch (mode) {       // Выбирает поведение в зависимости от текущего режима.
+  case MODE_STANDBY:    // Если сейчас режим ожидания.
+    handleStandby(btn); // Выполняет логику standby.
+    break;              // Завершает этот case.
+
+  case MODE_ACTIVE:    // Если сейчас активный режим.
+    handleActive(btn); // Выполняет логику active.
+    break;             // Завершает этот case.
+
+  case MODE_ALARM:    // Если сейчас режим тревоги.
+    handleAlarm(btn); // Выполняет логику alarm.
+    break;            // Завершает этот case.
+  }
 }
